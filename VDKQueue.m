@@ -47,21 +47,26 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 	NSString*		_path;
 	int				_watchedFD;
 	u_int			_subscriptionFlags;
+	VDKPathBlock	_block;
 }
 
-- (id) initWithPath:(NSString*)inPath andSubscriptionFlags:(u_int)flags;
+- (id) initWithPath:(NSString*)inPath block:(VDKPathBlock)aBlock andSubscriptionFlags:(u_int)flags;
 
 @property (atomic, copy) NSString *path;
 @property (atomic, assign) int watchedFD;
 @property (atomic, assign) u_int subscriptionFlags;
+@property (strong)	VDKPathBlock	block;
 
 @end
 
 @implementation VDKQueuePathEntry
-@synthesize path = _path, watchedFD = _watchedFD, subscriptionFlags = _subscriptionFlags;
+@synthesize path = _path;
+@synthesize watchedFD = _watchedFD;
+@synthesize subscriptionFlags = _subscriptionFlags;
+@synthesize block = _block;
 
 
-- (id) initWithPath:(NSString*)inPath andSubscriptionFlags:(u_int)flags;
+- (id) initWithPath:(NSString*)inPath block:(VDKPathBlock)aBlock andSubscriptionFlags:(u_int)flags;
 {
     self = [super init];
 	if (self)
@@ -70,23 +75,21 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 		_watchedFD = open([_path fileSystemRepresentation], O_EVTONLY, 0);
 		if (_watchedFD < 0)
 		{
-			[self autorelease];
 			return nil;
 		}
 		_subscriptionFlags = flags;
+		_block = aBlock;
 	}
 	return self;
 }
 
 -(void)	dealloc
 {
-	[_path release];
 	_path = nil;
     
 	if (_watchedFD >= 0) close(_watchedFD);
 	_watchedFD = -1;
 	
-	[super dealloc];
 }
 
 @end
@@ -113,7 +116,8 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 
 
 @implementation VDKQueue
-@synthesize delegate = _delegate, alwaysPostNotifications = _alwaysPostNotifications;
+@synthesize delegate = _delegate;
+@synthesize alwaysPostNotifications = _alwaysPostNotifications;
 
 
 
@@ -128,7 +132,6 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 		_coreQueueFD = kqueue();
 		if (_coreQueueFD == -1)
 		{
-			[self autorelease];
 			return nil;
 		}
 		
@@ -147,10 +150,8 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
     // Do this to close all the open file descriptors for files we're watching
     [self removeAllPaths];
     
-    [_watchedPathEntries release];
     _watchedPathEntries = nil;
     
-    [super dealloc];
 }
 
 
@@ -160,7 +161,7 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 #pragma mark -
 #pragma mark PRIVATE METHODS
 
-- (VDKQueuePathEntry *)	addPathToQueue:(NSString *)path notifyingAbout:(u_int)flags
+- (VDKQueuePathEntry *)	addPathToQueue:(NSString *)path block:(VDKPathBlock)aBlock notifyingAbout:(u_int)flags
 {
 	@synchronized(self)
 	{
@@ -172,7 +173,7 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
             // All flags already set?
 			if(([pathEntry subscriptionFlags] & flags) == flags) 
             {
-				return [[pathEntry retain] autorelease]; 
+				return pathEntry; 
             }
 			
 			flags |= [pathEntry subscriptionFlags];
@@ -183,12 +184,12 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 		
 		if (!pathEntry)
         {
-            pathEntry = [[[VDKQueuePathEntry alloc] initWithPath:path andSubscriptionFlags:flags] autorelease];
+            pathEntry = [[VDKQueuePathEntry alloc] initWithPath:path block:aBlock andSubscriptionFlags:flags];
         }
         
 		if (pathEntry)
 		{
-			EV_SET(&ev, [pathEntry watchedFD], EVFILT_VNODE, EV_ADD | EV_ENABLE | EV_CLEAR, flags, 0, pathEntry);
+			EV_SET(&ev, [pathEntry watchedFD], EVFILT_VNODE, EV_ADD | EV_ENABLE | EV_CLEAR, flags, 0, (__bridge void *)(pathEntry));
 			
 			[pathEntry setSubscriptionFlags:flags];
             
@@ -203,7 +204,7 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 			}
         }
         
-        return [[pathEntry retain] autorelease];
+        return pathEntry;
     }
     
     return nil;
@@ -250,10 +251,11 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
                         //        check here to try to eliminate this (infrequent) problem. In theory, a KEVENT that does not have a VDKQueuePathEntry
                         //        object attached as the udata parameter is not an event we registered for, so we should not be "missing" any events. In theory.
                         //
-                        id pe = ev.udata;
+                        id pe = (__bridge id)(ev.udata);
                         if (pe && [pe respondsToSelector:@selector(path)])
                         {
-                            NSString *fpath = [((VDKQueuePathEntry *)pe).path retain];         // Need to retain so it does not disappear while the block at the bottom is waiting to run on the main thread. Released in that block.
+							VDKQueuePathEntry	*pathEntry = (VDKQueuePathEntry *)pe;
+                            NSString *fpath = pathEntry.path;
                             if (!fpath) continue;
                             
                             [[NSWorkspace sharedWorkspace] noteFileSystemChanged:fpath];
@@ -297,22 +299,23 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
                             
                             // Post the notifications (or call the delegate method) on the main thread.
                             dispatch_async(dispatch_get_main_queue(),
-                                           ^{
-                                               for (NSString *note in notes)
-                                               {
-                                                   [_delegate VDKQueue:self receivedNotification:note forPath:fpath];
-                                                   
-                                                   if (!_delegate || _alwaysPostNotifications)
-                                                   {
-                                                       NSDictionary *userInfoDict = [[NSDictionary alloc] initWithObjectsAndKeys:fpath, @"path", nil];
-                                                       [[[NSWorkspace sharedWorkspace] notificationCenter] postNotificationName:note object:self userInfo:userInfoDict];
-                                                       [userInfoDict release];
-                                                   }
-                                               }
-                                               
-                                               [fpath release];
-                                               [notes release];
-                                           });
+								   ^{
+									   for (NSString *note in notes)
+									   {
+										   [_delegate VDKQueue:self receivedNotification:note forPath:fpath];
+										   
+										   if (pathEntry.block) {
+											   pathEntry.block(self, note, pathEntry.path);
+										   }
+										   
+										   if ((!_delegate && !pathEntry.block) || _alwaysPostNotifications)
+										   {
+											   NSDictionary *userInfoDict = [[NSDictionary alloc] initWithObjectsAndKeys:fpath, @"path", nil];
+											   [[[NSWorkspace sharedWorkspace] notificationCenter] postNotificationName:note object:self userInfo:userInfoDict];
+										   }
+									   }
+									   
+								   });
                         }
                     }
                 }
@@ -329,8 +332,6 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 	if(close(theFD) == -1) {
        NSLog(@"VDKQueue watcherThread: Couldn't close main kqueue (%d)", errno); 
     }
-    
-    [notesToPost release];
     
 #if DEBUG_LOG_THREAD_LIFETIME
 	NSLog(@"watcherThread finished.");
@@ -351,30 +352,21 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 - (void) addPath:(NSString *)aPath
 {
     if (!aPath) return;
-    [aPath retain];
+	[self addPath:aPath withBlock:nil notifyingAbout:VDKQueueNotifyDefault];
     
-    @synchronized(self)
-    {
-        VDKQueuePathEntry *entry = [_watchedPathEntries objectForKey:aPath];
-        
-        // Only add this path if we don't already have it.
-        if (!entry)
-        {
-            entry = [self addPathToQueue:aPath notifyingAbout:VDKQueueNotifyDefault];
-            if (!entry) {
-                NSLog(@"VDKQueue tried to add the path %@ to watchedPathEntries, but the VDKQueuePathEntry was nil. \nIt's possible that the host process has hit its max open file descriptors limit.", aPath);
-            }
-        }
-    }
-    
-    [aPath release];
 }
 
 
 - (void) addPath:(NSString *)aPath notifyingAbout:(u_int)flags
 {
     if (!aPath) return;
-    [aPath retain];
+	[self addPath:aPath withBlock:nil notifyingAbout:flags];
+    
+}
+
+- (void)addPath:(NSString *)aPath withBlock:(VDKPathBlock)aBlock notifyingAbout:(u_int)flags;
+{
+    if (!aPath) return;
     
     @synchronized(self)
     {
@@ -383,21 +375,18 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
         // Only add this path if we don't already have it.
         if (!entry)
         {
-            entry = [self addPathToQueue:aPath notifyingAbout:flags];
+            entry = [self addPathToQueue:aPath block:aBlock notifyingAbout:flags];
             if (!entry) {
                 NSLog(@"VDKQueue tried to add the path %@ to watchedPathEntries, but the VDKQueuePathEntry was nil. \nIt's possible that the host process has hit its max open file descriptors limit.", aPath);
             }
         }
     }
     
-    [aPath release];
 }
-
 
 - (void) removePath:(NSString *)aPath
 {
     if (!aPath) return;
-    [aPath retain];
     
     @synchronized(self)
 	{
@@ -409,7 +398,6 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
         }
 	}
     
-    [aPath release];
 }
 
 
