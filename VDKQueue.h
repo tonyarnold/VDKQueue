@@ -113,6 +113,7 @@ extern NSString * VDKQueueAccessRevocationNotification;
 
 
 typedef void (^VDKPathBlock)(VDKQueue *queue, NSString *note, NSString *affectedPath);
+typedef void (^VDKProcessQuitBlock)(VDKQueue *queue, NSString *processName, NSString *processBundleID, pid_t processID);
 
 
 @interface VDKQueue : NSObject
@@ -126,6 +127,14 @@ typedef void (^VDKPathBlock)(VDKQueue *queue, NSString *note, NSString *affected
     BOOL                    _keepWatcherThreadRunning;              // Set to NO to cancel the thread that watches _coreQueueFD for kQueue events
 }
 
+//
+//	Execute the block when the process indicated (either by process id or bundle ID) quits
+//
+//	Does nothing if that process is not currently runnning. Will remove the event when it is triggered
+//		as it means that the process is no longer valid.
+//
+- (void)executeBlock:(VDKProcessQuitBlock)processBlock forProcessIDOnExit:(pid_t)processID;
+- (void)executeBlock:(VDKProcessQuitBlock)processBlock forBundleIDOnExit:(NSString *)bundleID;
 
 //
 //  Note: there is no need to ask whether a path is already being watched. Just add it or remove it and this class

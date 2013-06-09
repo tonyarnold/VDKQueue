@@ -86,6 +86,7 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 -(void)	dealloc
 {
 	_path = nil;
+	_block = nil;
     
 	if (_watchedFD >= 0) close(_watchedFD);
 	_watchedFD = -1;
@@ -96,7 +97,52 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 
 
 
+#pragma mark - VDKQueueProcessEntry -
+#pragma -----------------------------------------------------------------------
 
+@interface VDKQueueProcessEntry : NSObject
+
+@property (strong)	NSString			*name;
+@property (strong)	NSString			*bundleID;
+@property (assign)	pid_t				processID;
+@property (strong)	VDKProcessQuitBlock	block;
+
+- (id)initWithBundleID:(NSString *)bundleIdentifier block:(VDKProcessQuitBlock)theBlock;
+- (id)initWithProcessID:(pid_t)processIdentifier block:(VDKProcessQuitBlock)theBlock;
+
+@end
+
+@interface VDKQueueProcessEntry ()
+
+- (id)initWithRunningApplication:(NSRunningApplication *)runningApp block:(VDKProcessQuitBlock)theBlock;
+
+@end
+
+@implementation VDKQueueProcessEntry
+
+- (id)initWithRunningApplication:(NSRunningApplication *)runningApp block:(VDKProcessQuitBlock)theBlock {
+	if (runningApp == nil) {
+		return nil;
+	}
+	self = [super init];
+	if (self) {
+		self.name = runningApp.localizedName;
+		self.bundleID = runningApp.bundleIdentifier;
+		self.processID = runningApp.processIdentifier;
+		self.block = theBlock;
+	}
+	return self;
+}
+
+- (id)initWithBundleID:(NSString *)bundleIdentifier block:(VDKProcessQuitBlock)theBlock {
+	return [self initWithRunningApplication:[[NSRunningApplication runningApplicationsWithBundleIdentifier:bundleIdentifier] lastObject] block:theBlock];
+}
+
+- (id)initWithProcessID:(pid_t)processIdentifier block:(VDKProcessQuitBlock)theBlock {
+	return [self initWithRunningApplication:[NSRunningApplication runningApplicationWithProcessIdentifier:processIdentifier] block:theBlock];
+}
+
+@end
 
 
 
@@ -110,6 +156,8 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 #pragma ------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 @interface VDKQueue ()
+@property (strong)	NSMutableArray		*watchedProcessEntries;
+@property (assign)	dispatch_queue_t	modifyEventQueue;
 - (void) watcherThread:(id)sender;
 @end
 
@@ -137,6 +185,8 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 		
         _alwaysPostNotifications = NO;
 		_watchedPathEntries = [[NSMutableDictionary alloc] init];
+		self.watchedProcessEntries = [[NSMutableArray alloc] init];
+		self.modifyEventQueue = dispatch_queue_create("VDKQueue.modifyEventQueue", 0);
 	}
 	return self;
 }
@@ -257,6 +307,7 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 							VDKQueuePathEntry	*pathEntry = (VDKQueuePathEntry *)pe;
                             NSString *fpath = pathEntry.path;
                             if (!fpath) continue;
+							if (![_watchedPathEntries valueForKey:fpath]) continue;
                             
                             [[NSWorkspace sharedWorkspace] noteFileSystemChanged:fpath];
                             
@@ -295,8 +346,7 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
                             
                             
                             NSArray *notes = [[NSArray alloc] initWithArray:notesToPost];   // notesToPost will be changed in the next loop iteration, which will likely occur before the block below runs.
-                            
-                            
+							
                             // Post the notifications (or call the delegate method) on the main thread.
                             dispatch_async(dispatch_get_main_queue(),
 								   ^{
@@ -319,6 +369,30 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
                         }
                     }
                 }
+				else if (ev.filter == EVFILT_PROC) {
+					id pe = (__bridge id)(ev.udata);
+					if (pe && [pe respondsToSelector:@selector(bundleID)]) {
+						VDKQueueProcessEntry	*processEntry = (VDKQueueProcessEntry *)pe;
+						if (processEntry.block) {
+							dispatch_async(dispatch_get_main_queue(), ^{
+								processEntry.block(self, processEntry.name, processEntry.bundleID, processEntry.processID);
+							});
+						}
+						
+						dispatch_async(self.modifyEventQueue, ^{
+							//	Remove the event from the queue
+							//	Remove the kevent for this path
+							struct timespec		nullts = { 0, 0 };
+							struct kevent		removeEvent;
+							
+							EV_SET(&removeEvent, processEntry.processID, EVFILT_PROC, EV_DELETE, NOTE_EXIT, 0, NULL);
+							kevent(_coreQueueFD, &removeEvent, 1, NULL, 0, &nullts);
+							
+							//	Remove the entry from our list
+							[self.watchedProcessEntries removeObject:processEntry];
+						});
+					}
+				}
             }
         }
         
@@ -341,12 +415,40 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 
 
 
+- (void)watchForExitOfProcessEntry:(VDKQueueProcessEntry *)processEntry {
+	
+	if (processEntry == nil) {
+		return;
+	}
+	
+	dispatch_async(self.modifyEventQueue, ^{
+		//	Add the kevent for this process
+		struct timespec		nullts = { 0, 0 };
+		struct kevent		ev;
+		
+		EV_SET(&ev, processEntry.processID, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, (__bridge void *)processEntry);
+		if (kevent(_coreQueueFD, &ev, 1, NULL, 0, &nullts) != -1) {
+			[self.watchedProcessEntries addObject:processEntry];
+		}
+	});
+	
+}
+
 
 
 
 #pragma mark -
 #pragma mark PUBLIC METHODS
 #pragma -----------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+- (void)executeBlock:(VDKProcessQuitBlock)processBlock forProcessIDOnExit:(pid_t)processID {
+	[self watchForExitOfProcessEntry:[[VDKQueueProcessEntry alloc] initWithProcessID:processID block:processBlock]];
+}
+
+- (void)executeBlock:(VDKProcessQuitBlock)processBlock forBundleIDOnExit:(NSString *)bundleID {
+	[self watchForExitOfProcessEntry:[[VDKQueueProcessEntry alloc] initWithBundleID:bundleID block:processBlock]];
+}
 
 
 - (void) addPath:(NSString *)aPath
@@ -384,18 +486,27 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
     
 }
 
-- (void) removePath:(NSString *)aPath
+- (void)removePath:(NSString *)aPath
 {
     if (!aPath) return;
     
     @synchronized(self)
 	{
-		VDKQueuePathEntry *entry = [_watchedPathEntries objectForKey:aPath];
+		VDKQueuePathEntry *pathEntry = [_watchedPathEntries objectForKey:aPath];
         
         // Remove it only if we're watching it.
-        if (entry) {
-            [_watchedPathEntries removeObjectForKey:aPath];
-        }
+        if (pathEntry) {
+			//	Remove the kevent for this path
+			struct timespec		nullts = { 0, 0 };
+			struct kevent		ev;
+			
+			EV_SET(&ev, pathEntry.watchedFD, EVFILT_VNODE, EV_DELETE, pathEntry.subscriptionFlags, 0, NULL);
+            kevent(_coreQueueFD, &ev, 1, NULL, 0, &nullts);
+
+			//	Remove from our list
+			[_watchedPathEntries removeObjectForKey:aPath];
+			
+		}
 	}
     
 }
@@ -405,7 +516,19 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 {
     @synchronized(self)
     {
-        [_watchedPathEntries removeAllObjects];
+
+        for (VDKQueuePathEntry *pathEntry in _watchedPathEntries) {
+			
+			//	Remove the kevent for this path
+			struct timespec		nullts = { 0, 0 };
+			struct kevent		ev;
+			
+			EV_SET(&ev, pathEntry.watchedFD, EVFILT_VNODE, EV_DELETE, pathEntry.subscriptionFlags, 0, NULL);
+			kevent(_coreQueueFD, &ev, 1, NULL, 0, &nullts);
+			
+		}
+		
+		[_watchedPathEntries removeAllObjects];
     }
 }
 
