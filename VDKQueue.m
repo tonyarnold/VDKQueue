@@ -517,8 +517,9 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
     @synchronized(self)
     {
 
-        for (VDKQueuePathEntry *pathEntry in _watchedPathEntries) {
-			
+        for (id pathKey in [_watchedPathEntries allKeys]) {
+
+			VDKQueuePathEntry *pathEntry = [_watchedPathEntries objectForKey:pathKey];
 			//	Remove the kevent for this path
 			struct timespec		nullts = { 0, 0 };
 			struct kevent		ev;
