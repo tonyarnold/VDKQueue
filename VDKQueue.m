@@ -157,7 +157,7 @@ NSString * VDKQueueAccessRevocationNotification = @"VDKQueueAccessWasRevokedNoti
 
 @interface VDKQueue ()
 @property (strong)	NSMutableArray		*watchedProcessEntries;
-@property (assign)	dispatch_queue_t	modifyEventQueue;
+@property (strong)	dispatch_queue_t	modifyEventQueue;
 - (void) watcherThread:(id)sender;
 @end
 
